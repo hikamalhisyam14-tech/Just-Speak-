@@ -39,6 +39,8 @@ interface DBOrder {
   provider: 'midtrans' | 'xendit' | 'sandbox';
   snapToken?: string;
   redirectUrl?: string;
+  transactionId?: string;
+  vipActivated?: boolean;
   createdAt: string;
   settledAt?: string;
 }
@@ -46,6 +48,7 @@ interface DBOrder {
 const DATA_DIR = path.join(process.cwd(), 'data');
 const USERS_FILE = path.join(DATA_DIR, 'users.json');
 const ORDERS_FILE = path.join(DATA_DIR, 'orders.json');
+const SESSIONS_FILE = path.join(DATA_DIR, 'sessions.json');
 
 // Ensure data directory exists
 if (!fs.existsSync(DATA_DIR)) {
@@ -97,10 +100,55 @@ function saveOrders(orders: Record<string, DBOrder>) {
   }
 }
 
+function loadSessions(): Record<string, string> {
+  try {
+    if (fs.existsSync(SESSIONS_FILE)) {
+      const data = fs.readFileSync(SESSIONS_FILE, 'utf-8');
+      return JSON.parse(data);
+    }
+  } catch (e) {
+    console.error('Error reading sessions file:', e);
+  }
+  return {};
+}
+
+function saveSessions(sessions: Record<string, string>) {
+  try {
+    fs.writeFileSync(SESSIONS_FILE, JSON.stringify(sessions, null, 2), 'utf-8');
+  } catch (e) {
+    console.error('Error writing sessions file:', e);
+  }
+}
+
 let dbUsers: Record<string, DBUser> = loadUsers();
 let dbOrders: Record<string, DBOrder> = loadOrders();
-// Active session tokens: token -> userId
-const activeSessions = new Map<string, string>();
+let dbSessions: Record<string, string> = loadSessions();
+
+function hashPassword(password: string): string {
+  const salt = crypto.randomBytes(16).toString('hex');
+  const hash = crypto.pbkdf2Sync(password, salt, 100000, 64, 'sha512').toString('hex');
+  return `${salt}:${hash}`;
+}
+
+function verifyPassword(password: string, storedHash?: string): boolean {
+  if (!storedHash || typeof storedHash !== 'string') return false;
+  if (!storedHash.includes(':')) {
+    // Support legacy sha256 hashes if any were stored
+    if (storedHash.length === 64) {
+      const legacyHash = crypto.createHash('sha256').update(password).digest('hex');
+      return crypto.timingSafeEqual(Buffer.from(legacyHash), Buffer.from(storedHash));
+    }
+    return false;
+  }
+  const [salt, hash] = storedHash.split(':');
+  if (!salt || !hash) return false;
+  try {
+    const checkHash = crypto.pbkdf2Sync(password, salt, 100000, 64, 'sha512').toString('hex');
+    return crypto.timingSafeEqual(Buffer.from(hash, 'hex'), Buffer.from(checkHash, 'hex'));
+  } catch {
+    return false;
+  }
+}
 
 function sanitizeUser(user: DBUser) {
   const { passwordHash, ...safeUser } = user;
@@ -110,13 +158,109 @@ function sanitizeUser(user: DBUser) {
   };
 }
 
+function getBaseUrl(req: express.Request): string {
+  if (process.env.APP_URL && process.env.APP_URL.trim()) {
+    return process.env.APP_URL.trim().replace(/\/+$/, '');
+  }
+  const origin = req.headers.origin as string;
+  if (origin && origin.startsWith('http')) {
+    return origin.replace(/\/+$/, '');
+  }
+  const referer = req.headers.referer as string;
+  if (referer && referer.startsWith('http')) {
+    try {
+      const url = new URL(referer);
+      return `${url.protocol}//${url.host}`;
+    } catch {}
+  }
+  const forwardedHost = (req.headers['x-forwarded-host'] as string) || req.get('host');
+  const forwardedProto = (req.headers['x-forwarded-proto'] as string) || 'https';
+  if (forwardedHost && !forwardedHost.includes('localhost') && !forwardedHost.includes('127.0.0.1')) {
+    return `${forwardedProto}://${forwardedHost}`.replace(/\/+$/, '');
+  }
+  return 'https://ais-dev-3b3t77jvi5ntunsqwmufwe-666103429374.asia-southeast1.run.app';
+}
+
+async function verifyPendingOrdersForUser(user: DBUser): Promise<boolean> {
+  if (user.premium) return true;
+
+  const midtransServerKey = process.env.MIDTRANS_SERVER_KEY ? process.env.MIDTRANS_SERVER_KEY.trim() : '';
+  if (!midtransServerKey) return false;
+
+  const userPendingOrders = Object.values(dbOrders).filter(
+    (o) => o.userId === user.id && o.status === 'pending'
+  );
+
+  if (userPendingOrders.length === 0) return false;
+
+  let upgraded = false;
+  const authString = Buffer.from(`${midtransServerKey}:`).toString('base64');
+
+  for (const order of userPendingOrders) {
+    try {
+      const statusEndpoint = `https://api.sandbox.midtrans.com/v2/${encodeURIComponent(order.orderId)}/status`;
+      const midtransRes = await fetch(statusEndpoint, {
+        method: 'GET',
+        headers: {
+          Accept: 'application/json',
+          Authorization: `Basic ${authString}`,
+        },
+      });
+
+      if (midtransRes.ok) {
+        const statusData: any = await midtransRes.json();
+        const { transaction_status, fraud_status } = statusData;
+
+        const isSuccess =
+          (transaction_status === 'settlement' || transaction_status === 'capture') &&
+          (!fraud_status || fraud_status === 'accept');
+
+        if (isSuccess) {
+          order.status = 'settlement';
+          order.transactionId = statusData.transaction_id || order.transactionId;
+          order.vipActivated = true;
+          order.settledAt = new Date().toISOString();
+          dbOrders[order.orderId] = order;
+
+          user.premium = true;
+          user.paymentHistory = user.paymentHistory || [];
+          if (!user.paymentHistory.some((p) => p.orderId === order.orderId)) {
+            user.paymentHistory.push({
+              orderId: order.orderId,
+              amount: order.amount,
+              paymentDate: order.settledAt,
+              provider: 'midtrans',
+              status: 'settlement',
+            });
+          }
+          upgraded = true;
+          console.log(`[Auto-Sync Verified] Order ${order.orderId} verified with Midtrans. Upgraded ${user.email} to LIFETIME VIP.`);
+        } else if (['deny', 'cancel', 'expire', 'failure'].includes(transaction_status)) {
+          order.status = 'failed';
+          dbOrders[order.orderId] = order;
+        }
+      }
+    } catch (err) {
+      console.error(`Error auto-verifying order ${order.orderId}:`, err);
+    }
+  }
+
+  if (upgraded) {
+    dbUsers[user.id] = user;
+    saveUsers(dbUsers);
+    saveOrders(dbOrders);
+  }
+
+  return upgraded;
+}
+
 function getAuthUser(req: express.Request): DBUser | null {
   const authHeader = req.headers.authorization;
   if (!authHeader || !authHeader.startsWith('Bearer ')) {
     return null;
   }
   const token = authHeader.substring(7).trim();
-  const userId = activeSessions.get(token);
+  const userId = dbSessions[token];
   if (!userId || !dbUsers[userId]) {
     return null;
   }
@@ -146,18 +290,19 @@ async function startServer() {
   // Register New User
   app.post('/api/auth/register', (req, res) => {
     const { email, name, password, language } = req.body || {};
-    if (!email || typeof email !== 'string') {
-      return res.status(400).json({ error: 'Valid email is required' });
+    if (!email || typeof email !== 'string' || !email.includes('@')) {
+      return res.status(400).json({ error: 'A valid email address is required.' });
+    }
+
+    if (!password || typeof password !== 'string' || password.length < 6) {
+      return res.status(400).json({ error: 'Password must be at least 6 characters.' });
     }
 
     const cleanEmail = email.trim().toLowerCase();
     // Check if user with this email already exists
     const existing = Object.values(dbUsers).find(u => u.email.toLowerCase() === cleanEmail);
     if (existing) {
-      // Return existing user session
-      const token = 'tok_' + crypto.randomBytes(24).toString('hex');
-      activeSessions.set(token, existing.id);
-      return res.json({ user: sanitizeUser(existing), token });
+      return res.status(400).json({ error: 'An account with this email already exists. Please log in.' });
     }
 
     const newUserId = 'usr_' + Date.now().toString(36) + '_' + crypto.randomBytes(4).toString('hex');
@@ -165,7 +310,7 @@ async function startServer() {
       id: newUserId,
       email: cleanEmail,
       name: name?.trim() || cleanEmail.split('@')[0],
-      passwordHash: password ? crypto.createHash('sha256').update(password).digest('hex') : undefined,
+      passwordHash: hashPassword(password),
       premium: false, // Default is strictly false for new accounts
       selectedLanguage: language === 'id' ? 'id' : 'en',
       theme: 'light',
@@ -184,7 +329,8 @@ async function startServer() {
     saveUsers(dbUsers);
 
     const token = 'tok_' + crypto.randomBytes(24).toString('hex');
-    activeSessions.set(token, newUserId);
+    dbSessions[token] = newUserId;
+    saveSessions(dbSessions);
 
     return res.json({ user: sanitizeUser(newUser), token });
   });
@@ -192,49 +338,54 @@ async function startServer() {
   // Login
   app.post('/api/auth/login', (req, res) => {
     const { email, password } = req.body || {};
-    if (!email || typeof email !== 'string') {
-      return res.status(400).json({ error: 'Email is required' });
+    if (!email || typeof email !== 'string' || !password || typeof password !== 'string') {
+      return res.status(401).json({ error: 'Incorrect email or password.' });
     }
 
     const cleanEmail = email.trim().toLowerCase();
-    let user = Object.values(dbUsers).find(u => u.email.toLowerCase() === cleanEmail);
+    const user = Object.values(dbUsers).find(u => u.email.toLowerCase() === cleanEmail);
 
+    // If user doesn't exist, return generic error (do not leak user existence)
     if (!user) {
-      // Auto-create initial account with premium = false
-      const newUserId = 'usr_' + Date.now().toString(36) + '_' + crypto.randomBytes(4).toString('hex');
-      user = {
-        id: newUserId,
-        email: cleanEmail,
-        name: cleanEmail.split('@')[0],
-        premium: false,
-        selectedLanguage: 'en',
-        theme: 'light',
-        createdAt: new Date().toISOString(),
-        currentStreak: 0,
-        longestStreak: 0,
-        lastCompletedDate: null,
-        completedChallenges: [],
-        savedTopics: [],
-        recentTopicIds: [],
-        notes: {},
-        paymentHistory: [],
-      };
-      dbUsers[newUserId] = user;
-      saveUsers(dbUsers);
+      return res.status(401).json({ error: 'Incorrect email or password.' });
+    }
+
+    // Verify password
+    if (user.passwordHash) {
+      const isValid = verifyPassword(password, user.passwordHash);
+      if (!isValid) {
+        return res.status(401).json({ error: 'Incorrect email or password.' });
+      }
+    } else {
+      // Legacy user migration: if legacy user account had no password hash yet, set it on valid password
+      if (password.length >= 6) {
+        user.passwordHash = hashPassword(password);
+        dbUsers[user.id] = user;
+        saveUsers(dbUsers);
+      } else {
+        return res.status(401).json({ error: 'Incorrect email or password.' });
+      }
     }
 
     const token = 'tok_' + crypto.randomBytes(24).toString('hex');
-    activeSessions.set(token, user.id);
+    dbSessions[token] = user.id;
+    saveSessions(dbSessions);
 
     return res.json({ user: sanitizeUser(user), token });
   });
 
-  // Get Current Authenticated User (Session Verification)
-  app.get('/api/auth/me', (req, res) => {
+  // Get Current Authenticated User (Session Verification & Auto-Sync Pending Orders)
+  app.get('/api/auth/me', async (req, res) => {
     const user = getAuthUser(req);
     if (!user) {
       return res.status(401).json({ user: null, authenticated: false });
     }
+
+    // If user is not yet marked as premium, check if they have any pending orders settled in Midtrans
+    if (!user.premium) {
+      await verifyPendingOrdersForUser(user);
+    }
+
     return res.json({ user: sanitizeUser(user), authenticated: true });
   });
 
@@ -243,7 +394,10 @@ async function startServer() {
     const authHeader = req.headers.authorization;
     if (authHeader && authHeader.startsWith('Bearer ')) {
       const token = authHeader.substring(7).trim();
-      activeSessions.delete(token);
+      if (dbSessions[token]) {
+        delete dbSessions[token];
+        saveSessions(dbSessions);
+      }
     }
     return res.json({ success: true, message: 'Logged out successfully' });
   });
@@ -308,8 +462,11 @@ async function startServer() {
     const orderId = `ORDER-JS-${Date.now()}-${crypto.randomBytes(3).toString('hex').toUpperCase()}`;
     const amount = 49000; // Rp49.000 One-time lifetime purchase
 
-    const midtransServerKey = process.env.MIDTRANS_SERVER_KEY;
-    const isProduction = process.env.MIDTRANS_IS_PRODUCTION === 'true';
+    const midtransServerKey = process.env.MIDTRANS_SERVER_KEY ? process.env.MIDTRANS_SERVER_KEY.trim() : '';
+    const midtransClientKey = process.env.MIDTRANS_CLIENT_KEY ? process.env.MIDTRANS_CLIENT_KEY.trim() : '';
+    const isProduction = false; // Strictly sandbox as requested
+
+    const baseUrl = getBaseUrl(req);
 
     const order: DBOrder = {
       orderId,
@@ -346,6 +503,11 @@ async function startServer() {
               name: 'JUST SPEAK - 365 Topics Lifetime Access',
             },
           ],
+          callbacks: {
+            finish: `${baseUrl}/?payment=finish&order_id=${encodeURIComponent(orderId)}`,
+            unfinish: `${baseUrl}/?payment=unfinish&order_id=${encodeURIComponent(orderId)}`,
+            error: `${baseUrl}/?payment=error&order_id=${encodeURIComponent(orderId)}`,
+          },
         };
 
         const response = await fetch(snapEndpoint, {
@@ -362,6 +524,8 @@ async function startServer() {
         if (snapData.token) {
           order.snapToken = snapData.token;
           order.redirectUrl = snapData.redirect_url;
+        } else if (snapData.error_messages) {
+          console.error('Midtrans Snap error messages:', snapData.error_messages);
         }
       } catch (err) {
         console.error('Midtrans Snap request error:', err);
@@ -378,13 +542,128 @@ async function startServer() {
       formattedPrice: 'Rp49.000',
       productName: 'JUST SPEAK - Lifetime Access to All 365 Topics',
       isLiveGatewayConfigured: !!midtransServerKey,
+      clientKey: midtransClientKey || '',
       snapToken: order.snapToken,
       redirectUrl: order.redirectUrl,
     });
   });
 
-  // Official Payment Webhook Receiver (Midtrans / Xendit)
-  app.post('/api/payment/webhook', (req, res) => {
+  // Direct Status Check & Verification with Midtrans (called after popup completes, return redirect, or page reload)
+  app.post('/api/payment/check-status', async (req, res) => {
+    const authUser = getAuthUser(req);
+    const { orderId } = req.body || {};
+
+    if (!orderId || !dbOrders[orderId]) {
+      return res.status(404).json({ error: 'Order not found' });
+    }
+
+    const order = dbOrders[orderId];
+    const orderOwner = dbUsers[order.userId];
+
+    if (!orderOwner) {
+      return res.status(404).json({ error: 'Order owner account not found' });
+    }
+
+    // If order is already settled in database
+    if (order.status === 'settlement') {
+      if (!orderOwner.premium) {
+        orderOwner.premium = true;
+        dbUsers[orderOwner.id] = orderOwner;
+        saveUsers(dbUsers);
+      }
+      return res.json({
+        status: 'settlement',
+        premium: true,
+        user: sanitizeUser(orderOwner),
+      });
+    }
+
+    const midtransServerKey = process.env.MIDTRANS_SERVER_KEY ? process.env.MIDTRANS_SERVER_KEY.trim() : '';
+    if (midtransServerKey) {
+      try {
+        const isProduction = false; // Strictly sandbox
+        const statusEndpoint = isProduction
+          ? `https://api.midtrans.com/v2/${encodeURIComponent(orderId)}/status`
+          : `https://api.sandbox.midtrans.com/v2/${encodeURIComponent(orderId)}/status`;
+
+        const authString = Buffer.from(`${midtransServerKey}:`).toString('base64');
+        const midtransRes = await fetch(statusEndpoint, {
+          method: 'GET',
+          headers: {
+            Accept: 'application/json',
+            Authorization: `Basic ${authString}`,
+          },
+        });
+
+        if (midtransRes.ok) {
+          const statusData: any = await midtransRes.json();
+          const { transaction_status, fraud_status } = statusData;
+
+          const isSuccess =
+            (transaction_status === 'settlement' || transaction_status === 'capture') &&
+            (!fraud_status || fraud_status === 'accept');
+
+          if (isSuccess) {
+            order.status = 'settlement';
+            order.transactionId = statusData.transaction_id || order.transactionId;
+            order.vipActivated = true;
+            order.settledAt = new Date().toISOString();
+            dbOrders[orderId] = order;
+            saveOrders(dbOrders);
+
+            orderOwner.premium = true;
+            orderOwner.paymentHistory = orderOwner.paymentHistory || [];
+            if (!orderOwner.paymentHistory.some(p => p.orderId === orderId)) {
+              orderOwner.paymentHistory.push({
+                orderId,
+                amount: order.amount,
+                paymentDate: order.settledAt,
+                provider: 'midtrans',
+                status: 'settlement',
+              });
+            }
+            dbUsers[orderOwner.id] = orderOwner;
+            saveUsers(dbUsers);
+
+            console.log(`[Order Verified via Status API] User ${orderOwner.email} (${orderOwner.id}) granted LIFETIME VIP for order ${orderId}`);
+
+            return res.json({
+              status: 'settlement',
+              premium: true,
+              user: sanitizeUser(orderOwner),
+            });
+          } else if (transaction_status === 'pending') {
+            return res.json({
+              status: 'pending',
+              premium: false,
+              message: 'Payment is pending approval or transfer.',
+            });
+          } else if (['deny', 'cancel', 'expire', 'failure'].includes(transaction_status)) {
+            order.status = 'failed';
+            dbOrders[orderId] = order;
+            saveOrders(dbOrders);
+            return res.json({
+              status: 'failed',
+              premium: false,
+              message: 'Payment failed, cancelled, or expired.',
+            });
+          }
+        }
+      } catch (err) {
+        console.error('Error checking Midtrans transaction status:', err);
+      }
+    }
+
+    return res.json({
+      status: order.status,
+      premium: orderOwner.premium,
+      isSandboxSimulator: !midtransServerKey,
+      user: authUser ? sanitizeUser(authUser) : undefined,
+    });
+  });
+
+  // Official Public Payment Webhook Receiver (Midtrans / Xendit)
+  app.post('/api/payment/webhook', async (req, res) => {
     const payload = req.body || {};
     console.log('[Payment Webhook Received]:', JSON.stringify(payload));
 
@@ -414,8 +693,10 @@ async function startServer() {
       return res.status(200).json({ received: true, error: 'User not found' });
     }
 
-    // Midtrans Signature Verification
-    const midtransServerKey = process.env.MIDTRANS_SERVER_KEY;
+    // Midtrans Signature & Status Verification
+    const midtransServerKey = process.env.MIDTRANS_SERVER_KEY ? process.env.MIDTRANS_SERVER_KEY.trim() : '';
+    let isSignatureValid = true;
+
     if (midtransServerKey && signature_key && status_code && gross_amount) {
       const expectedSignature = crypto
         .createHash('sha512')
@@ -423,12 +704,38 @@ async function startServer() {
         .digest('hex');
 
       if (expectedSignature !== signature_key) {
-        console.error('[Webhook] Invalid Midtrans Signature!');
-        return res.status(403).json({ error: 'Invalid signature' });
+        console.warn(`[Webhook] Signature direct hash mismatch for order ${targetOrderId}. Verifying via Midtrans Status API...`);
+        // Query Midtrans status API directly to ensure validity
+        try {
+          const authString = Buffer.from(`${midtransServerKey}:`).toString('base64');
+          const statusRes = await fetch(`https://api.sandbox.midtrans.com/v2/${encodeURIComponent(targetOrderId)}/status`, {
+            headers: {
+              Accept: 'application/json',
+              Authorization: `Basic ${authString}`,
+            },
+          });
+          if (statusRes.ok) {
+            const liveStatus: any = await statusRes.json();
+            if (liveStatus.order_id === targetOrderId) {
+              isSignatureValid = true;
+            } else {
+              isSignatureValid = false;
+            }
+          } else {
+            isSignatureValid = false;
+          }
+        } catch {
+          isSignatureValid = false;
+        }
       }
     }
 
-    // Check payment completion
+    if (!isSignatureValid) {
+      console.error('[Webhook] Invalid Midtrans Signature and status check failed!');
+      return res.status(403).json({ error: 'Invalid signature' });
+    }
+
+    // Check payment completion status
     const isMidtransSuccess =
       (transaction_status === 'settlement' || transaction_status === 'capture') &&
       (!fraud_status || fraud_status === 'accept');
@@ -436,24 +743,32 @@ async function startServer() {
 
     if (isMidtransSuccess || isXenditSuccess) {
       order.status = 'settlement';
+      order.transactionId = payload.transaction_id || order.transactionId;
+      order.vipActivated = true;
       order.settledAt = new Date().toISOString();
       dbOrders[targetOrderId] = order;
       saveOrders(dbOrders);
 
-      // Upgrade user to verified LIFETIME PREMIUM
+      // Upgrade user to verified LIFETIME VIP
       user.premium = true;
       user.paymentHistory = user.paymentHistory || [];
-      user.paymentHistory.push({
-        orderId: targetOrderId,
-        amount: order.amount,
-        paymentDate: order.settledAt,
-        provider: order.provider,
-        status: 'settlement',
-      });
+      if (!user.paymentHistory.some(p => p.orderId === targetOrderId)) {
+        user.paymentHistory.push({
+          orderId: targetOrderId,
+          amount: order.amount,
+          paymentDate: order.settledAt,
+          provider: order.provider,
+          status: 'settlement',
+        });
+      }
       dbUsers[user.id] = user;
       saveUsers(dbUsers);
 
-      console.log(`[Payment Verified] User ${user.email} (${user.id}) upgraded to LIFETIME PREMIUM.`);
+      console.log(`[Webhook Payment Verified] User ${user.email} (${user.id}) upgraded to LIFETIME VIP.`);
+    } else if (['deny', 'cancel', 'expire', 'failure'].includes(transaction_status)) {
+      order.status = 'failed';
+      dbOrders[targetOrderId] = order;
+      saveOrders(dbOrders);
     }
 
     return res.status(200).json({

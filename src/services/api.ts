@@ -354,6 +354,7 @@ export const api = {
     formattedPrice: string;
     productName: string;
     isLiveGatewayConfigured: boolean;
+    clientKey?: string;
     snapToken?: string;
     redirectUrl?: string;
   }> {
@@ -376,6 +377,39 @@ export const api = {
     }
 
     return res.json();
+  },
+
+  async checkOrderStatus(orderId: string): Promise<{
+    status: 'settlement' | 'pending' | 'failed';
+    premium: boolean;
+    user?: User;
+    message?: string;
+    isSandboxSimulator?: boolean;
+  }> {
+    const token = getAuthToken();
+    const headers: Record<string, string> = {
+      'Content-Type': 'application/json',
+    };
+    if (token) {
+      headers['Authorization'] = `Bearer ${token}`;
+    }
+
+    const res = await fetch('/api/payment/check-status', {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({ orderId }),
+    });
+
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({}));
+      throw new Error(err.error || 'Failed to check order status.');
+    }
+
+    const data = await res.json();
+    if (data.user) {
+      setCachedUser(data.user);
+    }
+    return data;
   },
 
   async verifyTestCheckout(orderId: string): Promise<User> {

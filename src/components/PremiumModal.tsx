@@ -1,5 +1,6 @@
-import React, { useState } from 'react';
-import { X, Check, Crown, ArrowRight, ShieldCheck, Loader2, AlertCircle, Sparkles, CheckCircle2 } from 'lucide-react';
+import React, { useState, useEffect, useRef } from 'react';
+import { X, Check, Crown, ArrowRight, ShieldCheck, Loader2, AlertCircle, ExternalLink, CheckCircle2, RefreshCw } from 'lucide-react';
+import confetti from 'canvas-confetti';
 import { useAuth } from '../context/AuthContext';
 import { api } from '../services/api';
 
@@ -14,21 +15,84 @@ export const PremiumModal: React.FC<PremiumModalProps> = ({ isOpen, onClose, onO
   const lang = user?.selectedLanguage || 'en';
 
   const [loading, setLoading] = useState(false);
+  const [verifying, setVerifying] = useState(false);
   const [error, setError] = useState('');
   const [activeOrder, setActiveOrder] = useState<{
     orderId: string;
     amount: number;
     formattedPrice: string;
     isLiveGatewayConfigured: boolean;
+    clientKey?: string;
     snapToken?: string;
     redirectUrl?: string;
   } | null>(null);
   const [paymentSuccess, setPaymentSuccess] = useState(false);
 
+  const pollTimerRef = useRef<any>(null);
+
+  // Clear polling on unmount or close
+  useEffect(() => {
+    return () => {
+      if (pollTimerRef.current) {
+        clearInterval(pollTimerRef.current);
+        pollTimerRef.current = null;
+      }
+    };
+  }, []);
+
+  // Auto-poll payment status every 4 seconds while an order is active and not yet settled
+  useEffect(() => {
+    if (!isOpen || !activeOrder || isPremium || paymentSuccess) {
+      if (pollTimerRef.current) {
+        clearInterval(pollTimerRef.current);
+        pollTimerRef.current = null;
+      }
+      return;
+    }
+
+    pollTimerRef.current = setInterval(async () => {
+      try {
+        const res = await api.checkOrderStatus(activeOrder.orderId);
+        if (res.premium || res.status === 'settlement') {
+          if (pollTimerRef.current) {
+            clearInterval(pollTimerRef.current);
+            pollTimerRef.current = null;
+          }
+          await refreshUser();
+          setPaymentSuccess(true);
+          triggerCelebration();
+        }
+      } catch {}
+    }, 4000);
+
+    return () => {
+      if (pollTimerRef.current) {
+        clearInterval(pollTimerRef.current);
+        pollTimerRef.current = null;
+      }
+    };
+  }, [isOpen, activeOrder?.orderId, isPremium, paymentSuccess, refreshUser]);
+
   if (!isOpen) return null;
+
+  const triggerCelebration = () => {
+    try {
+      confetti({
+        particleCount: 80,
+        spread: 80,
+        origin: { y: 0.6 },
+        colors: ['#E97D3B', '#166534', '#3C2A21', '#FFD166'],
+      });
+    } catch {}
+  };
 
   const handleStartCheckout = async () => {
     setError('');
+
+    // If user already has VIP, do not allow re-purchase
+    if (isPremium || user?.premium) {
+      return;
+    }
 
     // Require authentication before checkout
     if (!user) {
@@ -36,7 +100,11 @@ export const PremiumModal: React.FC<PremiumModalProps> = ({ isOpen, onClose, onO
         onClose();
         onOpenAuthModal();
       } else {
-        setError('Please log in or create an account first to attach your lifetime purchase.');
+        setError(
+          lang === 'id'
+            ? 'Silakan masuk atau daftar akun terlebih dahulu untuk mengaitkan akses VIP permanen Anda.'
+            : 'Please log in or create an account first to attach your permanent VIP access.'
+        );
       }
       return;
     }
@@ -46,30 +114,60 @@ export const PremiumModal: React.FC<PremiumModalProps> = ({ isOpen, onClose, onO
       const order = await api.createOrder();
       setActiveOrder(order);
 
-      // If live Midtrans Snap is available on window
-      if (order.snapToken && (window as any).snap) {
-        (window as any).snap.pay(order.snapToken, {
-          onSuccess: async () => {
-            await refreshUser();
-            setPaymentSuccess(true);
-          },
-          onPending: () => {
-            setError('Payment pending confirmation from payment gateway.');
-          },
-          onError: () => {
-            setError('Payment failed or cancelled.');
-          },
-          onClose: () => {
-            console.log('Customer closed popup without payment.');
-          },
-        });
-      } else if (order.redirectUrl && order.isLiveGatewayConfigured) {
-        window.location.href = order.redirectUrl;
+      // Open payment page in a NEW browser tab/window
+      if (order.redirectUrl) {
+        const opened = window.open(order.redirectUrl, '_blank');
+        if (!opened) {
+          // If popup was blocked by browser
+          setError(
+            lang === 'id'
+              ? 'Tab pembayaran terblokir oleh browser. Klik tombol "Buka Tab Pembayaran" di bawah.'
+              : 'Payment tab was blocked by browser. Please click "Open Payment Tab" below.'
+          );
+        }
+      } else if (order.snapToken) {
+        // Direct Sandbox fallback redirect URL
+        const fallbackUrl = `https://app.sandbox.midtrans.com/snap/v2/vtweb/${order.snapToken}`;
+        window.open(fallbackUrl, '_blank');
       }
     } catch (err: any) {
       setError(err.message || 'Could not initiate checkout.');
     } finally {
       setLoading(false);
+    }
+  };
+
+  const handleOpenPaymentTab = () => {
+    if (!activeOrder) return;
+    const url = activeOrder.redirectUrl || (activeOrder.snapToken ? `https://app.sandbox.midtrans.com/snap/v2/vtweb/${activeOrder.snapToken}` : '');
+    if (url) {
+      window.open(url, '_blank');
+    }
+  };
+
+  const handleCheckLiveStatus = async () => {
+    if (!activeOrder) return;
+    setVerifying(true);
+    setError('');
+    try {
+      const res = await api.checkOrderStatus(activeOrder.orderId);
+      if (res.premium || res.status === 'settlement') {
+        await refreshUser();
+        setPaymentSuccess(true);
+        triggerCelebration();
+      } else if (res.status === 'pending') {
+        setError(
+          lang === 'id'
+            ? 'Pembayaran sedang dikonfirmasi oleh sistem Midtrans. Mohon selesaikan transfer.'
+            : 'Payment is pending confirmation with Midtrans. Please finish payment.'
+        );
+      } else {
+        setError(res.message || (lang === 'id' ? 'Pembayaran belum diselesaikan.' : 'Payment is not yet completed.'));
+      }
+    } catch (err: any) {
+      setError(err.message || 'Verification check failed.');
+    } finally {
+      setVerifying(false);
     }
   };
 
@@ -81,6 +179,7 @@ export const PremiumModal: React.FC<PremiumModalProps> = ({ isOpen, onClose, onO
       await api.verifyTestCheckout(activeOrder.orderId);
       await refreshUser();
       setPaymentSuccess(true);
+      triggerCelebration();
     } catch (err: any) {
       setError(err.message || 'Verification failed.');
     } finally {
@@ -93,8 +192,10 @@ export const PremiumModal: React.FC<PremiumModalProps> = ({ isOpen, onClose, onO
     { en: 'All 8 categories unlocked (Psychology, Unknown Words, Science, etc.)', id: 'Semua 8 kategori terbuka (Psikologi, Konsep Langka, Sains, dll.)' },
     { en: 'Full 30-day speaking challenge & calendar progression', id: 'Tantangan bicara 30 hari & kalender progres lengkap' },
     { en: 'Streak tracking, personal notes & saved favorites', id: 'Pelacak streak bicara, catatan harian & topik tersimpan' },
-    { en: 'One-time payment: Lifetime access forever (No subscription)', id: 'Pembayaran sekali: Akses seumur hidup (Tanpa langganan)' },
+    { en: 'One-time payment: Lifetime VIP forever (No subscription)', id: 'Pembayaran sekali: Akses VIP seumur hidup (Tanpa langganan)' },
   ];
+
+  const hasVIP = isPremium || user?.premium || paymentSuccess;
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-[#3C2A21]/60 dark:bg-black/70 backdrop-blur-xs animate-in fade-in duration-200">
@@ -115,10 +216,22 @@ export const PremiumModal: React.FC<PremiumModalProps> = ({ isOpen, onClose, onO
         {/* Headline */}
         <div className="text-center mb-5">
           <h2 className="font-serif font-black text-2xl sm:text-3xl text-[#3C2A21] dark:text-[#FDFBF7] uppercase tracking-tight">
-            {lang === 'id' ? 'AKSES SEUMUR HIDUP 365 TOPIK' : 'UNLOCK ALL 365 TOPICS'}
+            {hasVIP
+              ? lang === 'id'
+                ? 'VIP UNLOCKED'
+                : 'VIP UNLOCKED'
+              : lang === 'id'
+              ? 'AKSES SEUMUR HIDUP 365 TOPIK'
+              : 'UNLOCK ALL 365 TOPICS'}
           </h2>
           <div className="inline-block mt-2 px-4 py-1 rounded-full bg-[#FFE9D9] dark:bg-[#3B2519] border border-[#FAD3B6] dark:border-[#5C3926] text-[#9C4221] dark:text-[#FFA675] font-serif font-bold text-xs uppercase tracking-wider">
-            {lang === 'id' ? 'Satu Kali Bayar · Rp49.000 · Akses Selamanya' : 'One-Time Payment · Rp49.000 · Lifetime Access'}
+            {hasVIP
+              ? lang === 'id'
+                ? 'Akses Seumur Hidup Aktif'
+                : 'Permanent Lifetime Access Active'
+              : lang === 'id'
+              ? 'Satu Kali Bayar · Rp49.000 · Akses Selamanya'
+              : 'One-Time Payment · Rp49.000 · Lifetime Access'}
           </div>
         </div>
 
@@ -143,20 +256,21 @@ export const PremiumModal: React.FC<PremiumModalProps> = ({ isOpen, onClose, onO
 
         {/* Action Button & States */}
         <div className="text-center space-y-3">
-          {isPremium || paymentSuccess ? (
+          {hasVIP ? (
+            /* PREVENT DUPLICATE PURCHASE: VIP UNLOCKED STATE */
             <div className="p-4 bg-[#E0E7D1] dark:bg-[#23351F] border border-[#C6D5B0] dark:border-[#385132] rounded-2xl text-[#166534] dark:text-[#86EFAC] font-serif font-bold text-xs sm:text-sm flex flex-col items-center justify-center gap-1">
               <div className="flex items-center gap-2">
                 <CheckCircle2 className="w-5 h-5" />
-                <span>{lang === 'id' ? 'LIFETIME VIP AKTIF' : 'LIFETIME VIP ACTIVE'}</span>
+                <span>{lang === 'id' ? 'VIP UNLOCKED' : 'VIP UNLOCKED'}</span>
               </div>
               <p className="text-[11px] font-sans font-normal opacity-90">
                 {lang === 'id'
-                  ? 'Semua 365 topik dan 8 kategori telah terbuka penuh di akunmu.'
-                  : 'All 365 topics and 8 categories are permanently unlocked.'}
+                  ? 'Akses VIP Anda telah aktif permanen di akun ini. Semua 365 topik dan 8 kategori terbuka penuh.'
+                  : 'Your VIP access is permanently active on this account. All 365 topics and 8 categories are fully unlocked.'}
               </p>
             </div>
-          ) : activeOrder && !activeOrder.isLiveGatewayConfigured ? (
-            // Development/Sandbox Server-Verified Testing Panel
+          ) : activeOrder ? (
+            /* ACTIVE ORDER: Midtrans payment opened in new tab, waiting for settlement */
             <div className="bg-[#FFF9F2] dark:bg-[#1E1714] border border-[#F2EDE4] dark:border-[#3D322B] rounded-2xl p-4 text-left space-y-3">
               <div className="flex items-center justify-between text-xs font-bold text-[#3C2A21] dark:text-[#FDFBF7]">
                 <span>Order ID: <span className="font-mono">{activeOrder.orderId}</span></span>
@@ -164,32 +278,53 @@ export const PremiumModal: React.FC<PremiumModalProps> = ({ isOpen, onClose, onO
               </div>
               <p className="text-[11px] text-[#736B5E] dark:text-[#A89F93]">
                 {lang === 'id'
-                  ? 'Kunci gateway Midtrans/Xendit belum diatur di .env. Kamu dapat memverifikasi simulasi pembayaran melalui endpoint server backend kami.'
-                  : 'Payment gateway API keys are running in sandbox verification mode. You can test backend verification.'}
+                  ? 'Halaman pembayaran Midtrans telah dibuka di tab baru. Selesaikan pembayaran Anda di sana, lalu kembali ke tab ini.'
+                  : 'Midtrans payment page opened in a new tab. Complete your payment there, then return to this tab.'}
               </p>
 
-              <button
-                onClick={handleVerifySandboxSettlement}
-                disabled={loading}
-                className="w-full py-3 px-4 bg-[#166534] hover:bg-[#14532D] text-white font-bold uppercase tracking-wider text-xs rounded-full shadow-md transition-all flex items-center justify-center gap-2 cursor-pointer disabled:opacity-70"
-              >
-                {loading ? (
-                  <Loader2 className="w-4 h-4 animate-spin" />
-                ) : (
-                  <>
-                    <ShieldCheck className="w-4 h-4" />
-                    <span>{lang === 'id' ? 'Verifikasi Pembayaran (Server)' : 'Verify Payment (Server Authoritative)'}</span>
-                  </>
-                )}
-              </button>
+              <div className="flex flex-col sm:flex-row gap-2">
+                <button
+                  onClick={handleOpenPaymentTab}
+                  className="flex-1 py-3 px-4 bg-[#E97D3B] hover:bg-[#D96B28] text-white font-bold uppercase tracking-wider text-xs rounded-full shadow-md transition-all flex items-center justify-center gap-1.5 cursor-pointer"
+                >
+                  <ExternalLink className="w-3.5 h-3.5" />
+                  <span>{lang === 'id' ? 'Buka Tab Pembayaran' : 'Open Payment Tab'}</span>
+                </button>
+                <button
+                  onClick={handleCheckLiveStatus}
+                  disabled={verifying}
+                  className="py-3 px-4 bg-[#166534] hover:bg-[#14532D] text-white font-bold uppercase tracking-wider text-xs rounded-full shadow-md transition-all flex items-center justify-center gap-1.5 cursor-pointer disabled:opacity-70"
+                >
+                  {verifying ? (
+                    <Loader2 className="w-4 h-4 animate-spin" />
+                  ) : (
+                    <>
+                      <RefreshCw className="w-3.5 h-3.5" />
+                      <span>{lang === 'id' ? 'Cek Status VIP' : 'Check VIP Status'}</span>
+                    </>
+                  )}
+                </button>
+              </div>
+
+              {!activeOrder.isLiveGatewayConfigured && (
+                <button
+                  onClick={handleVerifySandboxSettlement}
+                  disabled={loading}
+                  className="w-full py-2.5 px-4 bg-[#3C2A21] hover:bg-[#2A1D17] dark:bg-[#2D241F] text-white font-bold uppercase tracking-wider text-[11px] rounded-full shadow-xs transition-all flex items-center justify-center gap-1.5 cursor-pointer"
+                >
+                  <ShieldCheck className="w-3.5 h-3.5 text-[#E97D3B]" />
+                  <span>{lang === 'id' ? 'Simulasi Verifikasi Server (Test Sandbox)' : 'Simulate Server Verification (Sandbox)'}</span>
+                </button>
+              )}
             </div>
           ) : (
+            /* INITIAL UNPAID STATE: UNLOCK VIP BUTTON */
             <button
               onClick={handleStartCheckout}
-              disabled={loading}
+              disabled={loading || verifying}
               className="w-full py-4 px-6 bg-[#E97D3B] hover:bg-[#D96B28] text-white font-bold uppercase tracking-wider text-sm rounded-full shadow-lg shadow-orange-500/20 transition-all flex items-center justify-center gap-2 active:scale-95 cursor-pointer disabled:opacity-70"
             >
-              {loading ? (
+              {loading || verifying ? (
                 <Loader2 className="w-5 h-5 animate-spin" />
               ) : (
                 <>
@@ -221,3 +356,4 @@ export const PremiumModal: React.FC<PremiumModalProps> = ({ isOpen, onClose, onO
     </div>
   );
 };
+

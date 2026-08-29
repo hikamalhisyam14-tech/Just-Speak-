@@ -34,6 +34,11 @@ export const AuthModal: React.FC<AuthModalProps> = ({
       return;
     }
 
+    if (!password || password.length < 6) {
+      setError('Password must be at least 6 characters.');
+      return;
+    }
+
     setLoading(true);
     try {
       if (mode === 'signup') {
@@ -129,6 +134,8 @@ export const AuthModal: React.FC<AuthModalProps> = ({
                 value={password}
                 onChange={(e) => setPassword(e.target.value)}
                 placeholder="••••••••"
+                required
+                minLength={6}
                 className="w-full pl-11 pr-4 py-3 bg-[#FFFFFF] dark:bg-[#271F1A] border border-[#F2EDE4] dark:border-[#382B24] rounded-full text-sm text-[#3C2A21] dark:text-[#FDFBF7] placeholder:text-[#A69D91] dark:placeholder:text-[#8C8073] focus:outline-none focus:ring-2 focus:ring-[#E97D3B] focus:border-transparent transition-all"
               />
             </div>
@@ -199,6 +206,7 @@ export const AuthModal: React.FC<AuthModalProps> = ({
                 type="button"
                 onClick={() => {
                   setMode('login');
+                  setPassword('');
                   setError('');
                 }}
                 className="font-bold text-[#E97D3B] hover:underline uppercase tracking-wider text-[11px] cursor-pointer"
@@ -213,6 +221,7 @@ export const AuthModal: React.FC<AuthModalProps> = ({
                 type="button"
                 onClick={() => {
                   setMode('signup');
+                  setPassword('');
                   setError('');
                 }}
                 className="font-bold text-[#E97D3B] hover:underline uppercase tracking-wider text-[11px] cursor-pointer"

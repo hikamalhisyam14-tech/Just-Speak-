@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import { User, Globe, Crown, LogOut, CheckCircle2, Sun, Moon, LogIn, KeyRound } from 'lucide-react';
 import { useAuth } from '../context/AuthContext';
 
@@ -13,6 +13,11 @@ export const SettingsView: React.FC<SettingsViewProps> = ({ onOpenPremiumModal, 
 
   const [name, setName] = useState(user?.name || '');
   const [saveSuccess, setSaveSuccess] = useState(false);
+
+  // Synchronize local input state whenever the authenticated user changes
+  useEffect(() => {
+    setName(user?.name || '');
+  }, [user?.id, user?.name]);
 
   const handleSaveProfile = (e: React.FormEvent) => {
     e.preventDefault();
