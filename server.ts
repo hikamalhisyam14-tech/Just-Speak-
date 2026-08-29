@@ -25,7 +25,7 @@ interface DBUser {
     orderId: string;
     amount: number;
     paymentDate: string;
-    provider: 'midtrans' | 'xendit' | 'sandbox';
+    provider: 'midtrans' | 'sandbox';
     status: 'settlement' | 'pending' | 'failed';
   }[];
 }
@@ -36,7 +36,7 @@ interface DBOrder {
   email: string;
   amount: number;
   status: 'pending' | 'settlement' | 'failed';
-  provider: 'midtrans' | 'xendit' | 'sandbox';
+  provider: 'midtrans' | 'sandbox';
   snapToken?: string;
   redirectUrl?: string;
   transactionId?: string;
@@ -662,10 +662,10 @@ async function startServer() {
     });
   });
 
-  // Official Public Payment Webhook Receiver (Midtrans / Xendit)
+  // Official Public Payment Webhook Receiver (Midtrans)
   app.post('/api/payment/webhook', async (req, res) => {
     const payload = req.body || {};
-    console.log('[Payment Webhook Received]:', JSON.stringify(payload));
+    console.log('[Midtrans Payment Webhook Received]:', JSON.stringify(payload));
 
     const {
       order_id,
@@ -674,14 +674,11 @@ async function startServer() {
       signature_key,
       transaction_status,
       fraud_status,
-      // Xendit payload keys
-      external_id,
-      status: xenditStatus,
     } = payload;
 
-    const targetOrderId = order_id || external_id;
+    const targetOrderId = order_id;
     if (!targetOrderId || !dbOrders[targetOrderId]) {
-      console.warn(`[Webhook] Order ${targetOrderId} not found`);
+      console.warn(`[Webhook] Order ${targetOrderId} not found in database`);
       return res.status(200).json({ received: true, error: 'Order not found in database' });
     }
 
@@ -739,9 +736,8 @@ async function startServer() {
     const isMidtransSuccess =
       (transaction_status === 'settlement' || transaction_status === 'capture') &&
       (!fraud_status || fraud_status === 'accept');
-    const isXenditSuccess = xenditStatus === 'PAID';
 
-    if (isMidtransSuccess || isXenditSuccess) {
+    if (isMidtransSuccess) {
       order.status = 'settlement';
       order.transactionId = payload.transaction_id || order.transactionId;
       order.vipActivated = true;

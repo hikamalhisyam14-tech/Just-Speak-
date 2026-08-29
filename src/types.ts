@@ -47,7 +47,7 @@ export interface PaymentRecord {
   orderId: string;
   amount: number;
   paymentDate: string;
-  provider: 'midtrans' | 'xendit' | 'sandbox';
+  provider: 'midtrans' | 'sandbox';
   status: 'settlement' | 'pending' | 'failed';
 }
 
