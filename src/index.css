@@ -1,0 +1,77 @@
+@import "tailwindcss";
+
+@custom-variant dark (&:where(.dark, .dark *));
+
+@layer base {
+  :root {
+    --bg-main: #FDFBF7;
+    --bg-surface: #FFFFFF;
+    --bg-surface-warm: #FFF9F2;
+    --bg-card: #FFFFFF;
+    --border-subtle: #F2EDE4;
+    --border-strong: #3C2A21;
+    --text-primary: #3C2A21;
+    --text-secondary: #736B5E;
+    --text-muted: #A69D91;
+    --accent-orange: #E97D3B;
+  }
+
+  .dark {
+    --bg-main: #181412;
+    --bg-surface: #201A16;
+    --bg-surface-warm: #251E1A;
+    --bg-card: #201A16;
+    --border-subtle: #332720;
+    --border-strong: #4A3E36;
+    --text-primary: #FDFBF7;
+    --text-secondary: #D1C7BA;
+    --text-muted: #8C8073;
+    --accent-orange: #E97D3B;
+  }
+
+  body {
+    background-color: var(--bg-main);
+    color: var(--text-primary);
+    font-family: 'Plus Jakarta Sans', system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+    transition: background-color 0.2s ease, color 0.2s ease, border-color 0.2s ease;
+  }
+}
+
+.font-serif {
+  font-family: 'Fraunces', 'Playfair Display', Georgia, serif;
+}
+
+.font-display {
+  font-family: 'Fraunces', 'Playfair Display', 'Plus Jakarta Sans', serif;
+}
+
+.font-mono-timer {
+  font-family: 'JetBrains Mono', monospace;
+}
+
+/* Custom scrollbars matching warm organic tone */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+::-webkit-scrollbar-track {
+  background: #F2EDE4;
+}
+.dark ::-webkit-scrollbar-track {
+  background: #251E1A;
+}
+::-webkit-scrollbar-thumb {
+  background: #D5CEBF;
+  border-radius: 9999px;
+}
+.dark ::-webkit-scrollbar-thumb {
+  background: #4A3E36;
+  border-radius: 9999px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: #A69D91;
+}
+.dark ::-webkit-scrollbar-thumb:hover {
+  background: #6B5B50;
+}
+

@@ -1,0 +1,8 @@
+{
+  "name": "Copy of JUST SPEAK",
+  "description": "Pick something. Learn something. Speak for one minute. A daily speaking challenge platform that gives you unexpected topics to research, organize, and speak about.",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
